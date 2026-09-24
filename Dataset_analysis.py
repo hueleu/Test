@@ -4,9 +4,15 @@ vad_dataset_analysis.py
 Phân tích chất lượng dataset VAD + mức độ nghiêm trọng lỗi theo ngữ cảnh.
 
 Cấu trúc thư mục kỳ vọng:
-    <model_root>/<Category>_<idx>.txt                        (index start end score)
+    <model_root>/<Category>_<idx>.txt                        (raw YAMNet HOẶC đã rebin 0.5s)
     <gt_root>/<Category>/groundtruth/Gt_<category>_<idx>.txt (start end label)
 GT label chấp nhận: speech / non-speech (hoặc 1 / 0). Phân cách: space, tab, dấu phẩy.
+
+Model input (--model_mode, mặc định auto = tự nhận):
+    raw      : output YAMNet (window 0.96s, hop 0.08s) → script tự rescore, pad, merge, rebin 0.5s
+    rebinned : đã rebin 0.5s → đọc thẳng, KHÔNG post-process. Các dạng dòng chấp nhận:
+               [index] start end score | [index] start end label | [index] start end score label
+               (label = speech/non-speech hoặc 0/1; nếu chỉ có score thì dùng ngưỡng để ra nhãn)
 
 Chạy:
     python vad_dataset_analysis.py --model_root Model --gt_root Groundtruth --out vad_report
@@ -126,6 +132,87 @@ def gt_to_bins(segs, b):
     return lab
 
 
+def read_frames(path):
+    """Đọc file dạng frame/đoạn: [index] start end [score] [label]. Tự nhận cột theo nội dung."""
+    rows, labs = [], []
+    for line in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        tok = _tok(line)
+        if not tok:
+            continue
+        words = [t.lower() for t in tok if not _isnum(t)]
+        nums = [float(t) for t in tok if _isnum(t)]
+        lab = np.nan
+        if words:
+            w = words[-1]
+            if w in SPEECH:
+                lab = 1.0
+            elif w in NONSPEECH:
+                lab = 0.0
+            else:
+                continue                                   # dòng tiêu đề
+        if len(nums) < 2:
+            continue
+        rows.append(nums); labs.append(lab)
+    if not rows:
+        return pd.DataFrame(columns=["start", "end", "score", "label"], dtype=float)
+    w = min(len(r) for r in rows)
+    M = np.array([r[:w] for r in rows])
+    labs = np.array(labs, dtype=float)
+
+    def is_start_end(i):
+        # end >= start mọi dòng, > start ở hầu hết dòng (cho phép frame 0s do làm tròn), start tăng dần
+        if i + 1 >= w:
+            return False
+        d = M[:, i + 1] - M[:, i]
+        return bool((d >= -1e-9).all() and (d > 1e-9).mean() >= 0.9
+                    and (np.diff(M[:, i]) >= -1e-9).all())
+
+    si = 1 if is_start_end(1) else 0 if is_start_end(0) else None
+    if si is None:
+        raise SystemExit(f"Không nhận ra cột start/end trong {path}")
+    keep = M[:, si + 1] - M[:, si] > 1e-9                 # bỏ frame dài 0s
+    M, labs = M[keep], labs[keep]
+    extra = M[:, si + 2:]
+    score = extra[:, 0].copy() if extra.shape[1] >= 1 else np.full(len(M), np.nan)
+    if np.isnan(labs).all() and extra.shape[1] >= 2:
+        labs = extra[:, 1].copy()                          # start end score label(0/1)
+    if np.isnan(labs).all() and np.isfinite(score).all() and np.isin(score, [0.0, 1.0]).all():
+        labs, score = score, np.full(len(M), np.nan)      # cột duy nhất là nhãn 0/1
+    return pd.DataFrame(dict(start=M[:, si], end=M[:, si + 1], score=score, label=labs))
+
+
+def is_frame_grid(df, b, tol=0.02):
+    """True nếu mọi dòng (trừ dòng cuối có thể ngắn hơn) là 1 frame dài đúng b giây."""
+    if len(df) == 0:
+        return False
+    dur = (df.end - df.start).values
+    core = dur[:-1] if len(dur) > 1 else dur
+    return bool(np.all(np.abs(core - b) < tol) and dur[-1] <= b + tol)
+
+
+def frames_to_grid(df, col, b, n=None, who=""):
+    """Đặt giá trị df[col] lên lưới bin b giây.
+    Frame đúng b giây → đặt thẳng theo chỉ số (không rebin). Đoạn dài hơn → gán theo tâm bin."""
+    if n is None:
+        n = int(np.ceil(df.end.max() / b - 1e-9))
+    out = np.full(n, np.nan)
+    vals = df[col].values.astype(float)
+    if is_frame_grid(df, b):
+        k = np.round(df.start.values / b).astype(int)
+        off = np.abs(df.start.values - k * b).max()
+        if off > 0.01:
+            print(f"[WARN] {who}: frame lệch lưới {b}s tối đa {off:.3f}s — kiểm tra mốc thời gian")
+        if len(np.unique(k)) < len(k):
+            print(f"[WARN] {who}: có frame trùng chỉ số, giữ frame xuất hiện sau")
+        m = (k >= 0) & (k < n)
+        out[k[m]] = vals[m]
+    else:
+        c = (np.arange(n) + 0.5) * b
+        for s, e, v in zip(df.start.values, df.end.values, vals):
+            out[(c >= s) & (c < e)] = v
+    return out
+
+
 def model_to_bins(win, nb, cfg):
     hop, b, thr = cfg["hop"], cfg["bin"], cfg["threshold"]
     T = max(win[:, 1].max(), nb * b)
@@ -210,8 +297,28 @@ def metrics(gt, pr):
 
 # ----------------------------------------------------------------------------- per file
 def analyze_file(cat, name, mf, gf, cfg):
-    gt = gt_to_bins(read_gt(gf), cfg["bin"])
-    pred, pred_raw, score = model_to_bins(read_model(mf), len(gt), cfg)
+    b = cfg["bin"]
+    gdf = read_frames(gf)
+    if gdf.label.isna().all():
+        raise SystemExit(f"GT {gf}: không tìm thấy cột nhãn speech/non-speech")
+    g = frames_to_grid(gdf, "label", b, who=f"GT {name}")
+    gt = np.where(np.isnan(g), -1, g).astype(int)
+    if cfg["mode"] == "rebinned":
+        mdf = read_frames(mf)
+        if not is_frame_grid(mdf, b):
+            print(f"[WARN] Model {name}: dòng không phải frame {b}s — gán theo tâm bin")
+        score = frames_to_grid(mdf, "score", b, len(gt), f"Model {name}")
+        if mdf.label.notna().any():
+            p = frames_to_grid(mdf, "label", b, len(gt), f"Model {name}")
+        else:
+            p = np.where(np.isnan(score), np.nan, (score >= cfg["threshold"]).astype(float))
+        pred = np.where(np.isnan(p), -1, p).astype(int)
+        pred_raw = pred.copy()                            # không có bản raw ở chế độ này
+        miss = int(((pred < 0) & (gt >= 0)).sum())
+        if miss:
+            print(f"[WARN] {name}: {miss} frame GT không có frame model tương ứng → bỏ qua")
+    else:
+        pred, pred_raw, score = model_to_bins(read_model(mf), len(gt), cfg)
     seg_id, seg_type, seg_info = classify_segments(gt, cfg)
     dist = transition_dist(gt)
     sp_idx = np.flatnonzero(gt == 1)
@@ -222,7 +329,7 @@ def analyze_file(cat, name, mf, gf, cfg):
                              t0=np.arange(len(gt)) * cfg["bin"], y=gt, pred=pred,
                              pred_raw=pred_raw, fill_all=fill, all_speech=1, score=score,
                              seg=seg_id, seg_type=seg_type, dist=dist))
-    bins = bins[bins.y >= 0].copy()
+    bins = bins[(bins.y >= 0) & (bins.pred >= 0)].copy()
     bins["err"] = (bins.pred != bins.y).astype(int)
     bins["in_collar"] = bins.dist < cfg["collar_bins"]
     bins["weight"] = bins.seg_type.map(CONTEXT_W).fillna(1.0) * np.where(bins.in_collar, BOUNDARY_FACTOR, 1.0)
@@ -297,8 +404,12 @@ def build_report(bins, segs, errs, cfg, ci):
     add("=" * 78); add("BÁO CÁO PHÂN TÍCH DATASET & MỨC ĐỘ LỖI VAD"); add("=" * 78)
     add(f"Files: {bins.file.nunique()} | Categories: {bins.category.nunique()} | "
         f"Tổng thời lượng: {len(bins) * b / 60:.1f} phút | Tỷ lệ speech: {bins.y.mean():.1%}")
-    add(f"Ngưỡng={cfg['threshold']}, pad={cfg['pad_before']}/{cfg['pad_after']}s, "
-        f"merge<{cfg['merge_gap']}s, bin={b}s, collar={cfg['collar_bins']} bin")
+    if cfg["has_raw"]:
+        add(f"Model input: raw | Ngưỡng={cfg['threshold']}, pad={cfg['pad_before']}/{cfg['pad_after']}s, "
+            f"merge<{cfg['merge_gap']}s, bin={b}s, collar={cfg['collar_bins']} bin")
+    else:
+        add(f"Model input: đã rebin {b}s (không post-process lại) | collar={cfg['collar_bins']} bin | "
+            f"ngưỡng {cfg['threshold']} chỉ dùng cho file không có cột nhãn")
 
     # 1. structure
     add("\n[1] CẤU TRÚC ĐOẠN TRONG GROUND TRUTH")
@@ -314,12 +425,14 @@ def build_report(bins, segs, errs, cfg, ci):
 
     # 2. baselines
     add("\n[2] SO VỚI BASELINE NGÂY THƠ (toàn bộ bin)")
-    bl = pd.DataFrame({k: metrics(bins.y, bins[k]) for k in
-                       ["pred", "pred_raw", "fill_all", "all_speech"]}).T
-    bl.index = ["model (post-proc)", "model (raw, không post-proc)",
-                "fill-all (onset đầu→offset cuối)", "all-speech"]
+    names = {"pred": "model (post-proc)" if cfg["has_raw"] else "model (đã rebin)",
+             "pred_raw": "model (raw, không post-proc)",
+             "fill_all": "fill-all (onset đầu→offset cuối)", "all_speech": "all-speech"}
+    keys = [k for k in names if cfg["has_raw"] or k != "pred_raw"]
+    bl = pd.DataFrame({k: metrics(bins.y, bins[k]) for k in keys}).T
+    gap = bl.loc["pred"].F1 - bl.loc["fill_all"].F1
+    bl.index = [names[k] for k in keys]
     add(fmt(bl[["precision", "recall", "F1", "specificity", "accuracy"]]))
-    gap = bl.iloc[0].F1 - bl.iloc[2].F1
     add(f"→ Chênh F1 model − fill-all = {gap:+.3f}")
     if gap < 0.05:
         v.append(f"Dataset DỄ: fill-all chỉ kém model {gap:.3f} F1, metric toàn cục không phân biệt được model tốt/tầm thường.")
@@ -396,7 +509,9 @@ def build_report(bins, segs, errs, cfg, ci):
         add(fmt(ce[["file", "t_start", "t_end", "kind", "seg_type", "level", "mean_score"]], index=False))
     else:
         add(f"Không có lỗi vượt ngưỡng tự tin ({cfg['conf_hi']}/{cfg['conf_lo']}).")
-    if len(errs):
+    if len(errs) and errs.mean_score.isna().all():
+        add("File model không có cột score → không xếp được theo độ tự tin.")
+    elif len(errs):
         add("\nTop 10 lỗi có score xa ngưỡng nhất (nên nghe lại):")
         far = errs.assign(d=(errs.mean_score - cfg["threshold"]).abs()).sort_values("d", ascending=False).head(10)
         add(fmt(far[["file", "t_start", "t_end", "kind", "seg_type", "level", "mean_score"]], index=False))
@@ -488,8 +603,9 @@ def write_excel(path, bins, segs, errs, cfg, ci, verdicts):
     # ---- dữ liệu cho các sheet
     B = bins.assign(fill_err=(bins.fill_all != bins.y).astype(int),
                     in_collar=bins.in_collar.astype(int))[
-        ["category", "file", "bin", "t0", "y", "pred", "pred_raw", "fill_all", "all_speech",
-         "score", "seg", "seg_type", "dist", "err", "fill_err", "in_collar"]]
+        [c for c in ["category", "file", "bin", "t0", "y", "pred", "pred_raw", "fill_all", "all_speech",
+                     "score", "seg", "seg_type", "dist", "err", "fill_err", "in_collar"]
+         if cfg["has_raw"] or c != "pred_raw"]]
     S = segs[["category", "file", "seg", "type", "label", "b0", "b1", "dur", "pred_speech_frac"]]
     ecols = ["category", "file", "t_start", "t_end", "n_bins", "kind", "seg_type", "level",
              "mean_score", "confident"]
@@ -525,8 +641,12 @@ def write_excel(path, bins, segs, errs, cfg, ci, verdicts):
               "tự tính từ các sheet Bins / Segments / Error_runs / Per_file.", italic=True)
     pr = 4
     put(pr, 17, "THAM SỐ", bold=True, fill=SEC_FILL); put(pr, 18, None, fill=SEC_FILL); pr += 1
-    params = [("threshold", "Ngưỡng Youden"), ("hop", "Hop (s)"), ("pad_before", "Pad trước (s)"),
-              ("pad_after", "Pad sau (s)"), ("merge_gap", "Merge gap (s)"), ("bin", "Bin GT (s)"),
+    put(pr, 17, "Chế độ model input")
+    put(pr, 18, "raw" if cfg["has_raw"] else "đã rebin", color=BLUE); pr += 1
+    pipe = [("threshold", "Ngưỡng Youden"), ("hop", "Hop (s)"), ("pad_before", "Pad trước (s)"),
+            ("pad_after", "Pad sau (s)"), ("merge_gap", "Merge gap (s)")] if cfg["has_raw"] else \
+           [("threshold", "Ngưỡng (khi không có nhãn)")]
+    params = pipe + [("bin", "Bin GT (s)"),
               ("intra_gap_max", "intra_gap_max (s)"), ("turn_gap_max", "turn_gap_max (s)"),
               ("short_speech_max", "short_speech_max (s)"), ("collar_bins", "Collar (bin)"),
               ("conf_hi", "Ngưỡng tự tin FP"), ("conf_lo", "Ngưỡng tự tin FN"),
@@ -612,8 +732,12 @@ def write_excel(path, bins, segs, errs, cfg, ci, verdicts):
     r += 1; section(r, "[2] SO VỚI BASELINE NGÂY THƠ"); r += 1
     header(r, ["Predictor"] + MHDR); r += 1
     rows = {}
-    for col, lab in [("pred", "Model (post-proc)"), ("pred_raw", "Model raw (không post-proc)"),
-                     ("fill_all", "Fill-all (onset đầu → offset cuối)"), ("all_speech", "All-speech")]:
+    preds = [("pred", "Model (post-proc)" if cfg["has_raw"] else "Model (đã rebin)"),
+             ("pred_raw", "Model raw (không post-proc)"),
+             ("fill_all", "Fill-all (onset đầu → offset cuối)"), ("all_speech", "All-speech")]
+    for col, lab in preds:
+        if col == "pred_raw" and not cfg["has_raw"]:
+            continue
         metric_row(r, lab, col); rows[col] = r; r += 1
     put(r, 1, "Chênh F1: model − fill-all", bold=True)
     put(r, 2, f"=H{rows['pred']}-H{rows['fill_all']}", "+0.000;-0.000")
@@ -719,7 +843,9 @@ def write_excel(path, bins, segs, errs, cfg, ci, verdicts):
     r += 1; section(r, "[9] DANH SÁCH NÊN NGHE LẠI – lỗi có score xa ngưỡng nhất (có thể là lỗi nhãn GT)"); r += 1
     header(r, ["File", "Bắt đầu (s)", "Kết thúc (s)", "Loại lỗi", "Loại đoạn", "Mức", "Score TB",
                "Tự tin?"]); r += 1
-    if len(errs):
+    if len(errs) and errs.mean_score.isna().all():
+        put(r, 1, "File model không có cột score → không xếp được theo độ tự tin.", italic=True); r += 1
+    elif len(errs):
         far = errs.assign(d=(errs.mean_score - cfg["threshold"]).abs()) \
             .sort_values(["confident", "d"], ascending=False).head(15)
         for row in far.itertuples():
@@ -774,6 +900,8 @@ def main():
     ap.add_argument("--gt_root", default="Groundtruth")
     ap.add_argument("--out", default="vad_report.xlsx")
     ap.add_argument("--threshold", type=float, default=CFG["threshold"])
+    ap.add_argument("--model_mode", choices=["auto", "raw", "rebinned"], default="auto",
+                    help="raw = output YAMNet chưa xử lý; rebinned = đã rebin 0.5s")
     a = ap.parse_args()
     cfg = dict(CFG, threshold=a.threshold)
     out = Path(a.out)
@@ -784,6 +912,11 @@ def main():
     pairs = match_files(a.model_root, a.gt_root)
     if not pairs:
         raise SystemExit("Không ghép được cặp file Model/GT nào.")
+    mode = a.model_mode
+    if mode == "auto":
+        mode = "rebinned" if is_frame_grid(read_frames(pairs[0][2]), cfg["bin"]) else "raw"
+    cfg.update(mode=mode, has_raw=(mode == "raw"))
+    print(f"Chế độ model input: {mode}")
     B, S, E = [], [], []
     for cat, name, mf, gf in pairs:
         b_, s_, e_ = analyze_file(cat, name, mf, gf, cfg)
